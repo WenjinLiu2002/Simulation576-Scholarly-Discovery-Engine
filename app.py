@@ -163,17 +163,35 @@ def get_field_label(category: str) -> str:
 
 def search_arxiv(query: str, max_results: int = 5):
     """Search arXiv via raw API and return list of result dicts."""
+    import time, urllib.parse
     NS = "http://www.w3.org/2005/Atom"
+    encoded_query = urllib.parse.quote(query)
     url = (
-        f"http://export.arxiv.org/api/query"
-        f"?search_query=all:{requests.utils.quote(query)}"
-        f"&max_results={max_results}&sortBy=relevance"
+        f"https://export.arxiv.org/api/query"
+        f"?search_query=all:{encoded_query}"
+        f"&max_results={max_results}&sortBy=relevance&sortOrder=descending"
     )
-    try:
-        resp = requests.get(url, timeout=15, headers={"User-Agent": "ScholarlyDiscoveryEngine/1.0"})
-        resp.raise_for_status()
-    except Exception as e:
-        st.error(f"arXiv API error: {e}")
+    headers = {
+        "User-Agent": "ScholarlyDiscoveryEngine/1.0 (MASC576 class project)",
+        "Accept": "application/xml",
+    }
+    resp = None
+    for attempt in range(3):
+        try:
+            time.sleep(attempt * 3)
+            resp = requests.get(url, timeout=20, headers=headers)
+            if resp.status_code == 429:
+                st.warning(f"arXiv rate limit hit, retrying... (attempt {attempt+1}/3)")
+                time.sleep(5)
+                continue
+            resp.raise_for_status()
+            break
+        except Exception as e:
+            if attempt == 2:
+                st.error(f"arXiv API error after 3 attempts: {e}")
+                return []
+    if resp is None or resp.status_code != 200:
+        st.error(f"arXiv returned status {getattr(resp, 'status_code', 'N/A')}. Please try again in a few seconds.")
         return []
 
     root = ET.fromstring(resp.text)
