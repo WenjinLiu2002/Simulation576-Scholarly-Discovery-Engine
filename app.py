@@ -161,102 +161,95 @@ def get_field_label(category: str) -> str:
     if "eess" in cat: return "Elec. Eng."
     return "Other"
 
+OPENALEX_BASE = "https://api.openalex.org"
+OA_HEADERS = {"User-Agent": "ScholarlyDiscoveryEngine/1.0 (mailto:student@usc.edu)"}
+
+def _oa_abstract(inverted_index: dict) -> str:
+    """Reconstruct abstract from OpenAlex inverted index format."""
+    if not inverted_index:
+        return "No abstract available."
+    words = {}
+    for word, positions in inverted_index.items():
+        for pos in positions:
+            words[pos] = word
+    return " ".join(words[i] for i in sorted(words))
+
+def _oa_to_node(work: dict, node_type: str = "seed") -> dict:
+    """Convert an OpenAlex work dict to our standard node format."""
+    # ID
+    oa_id = work.get("id", "").replace("https://openalex.org/", "")
+    # ArXiv PDF link if available
+    locs = work.get("locations") or []
+    pdf_url = "#"
+    for loc in locs:
+        src = loc.get("source") or {}
+        if "arxiv" in (src.get("display_name") or "").lower() or "arxiv" in (loc.get("landing_page_url") or "").lower():
+            pdf_url = loc.get("pdf_url") or loc.get("landing_page_url") or "#"
+            break
+    if pdf_url == "#":
+        oa_pdf = (work.get("open_access") or {}).get("oa_url") or "#"
+        pdf_url = oa_pdf
+    # Authors
+    authors = [
+        (a.get("author") or {}).get("display_name", "")
+        for a in (work.get("authorships") or [])[:3]
+    ]
+    # Topic / field
+    topics = work.get("topics") or []
+    primary_cat = topics[0].get("field", {}).get("display_name", "other").lower() if topics else "other"
+    # Abstract
+    abstract = _oa_abstract(work.get("abstract_inverted_index"))
+    return {
+        "id": oa_id,
+        "title": work.get("display_name") or work.get("title") or "Unknown Title",
+        "authors": [a for a in authors if a],
+        "abstract": (abstract[:400] + "...") if len(abstract) > 400 else abstract,
+        "year": work.get("publication_year") or 0,
+        "url": pdf_url,
+        "categories": [primary_cat],
+        "primary_category": primary_cat,
+        "citations": work.get("cited_by_count") or 0,
+        "node_type": node_type,
+        "oa_id": oa_id,
+    }
+
 def search_arxiv(query: str, max_results: int = 5):
-    """Search using Semantic Scholar (primary) with arXiv XML as fallback."""
-    import time, urllib.parse
-
-    # ── PRIMARY: Semantic Scholar search (no rate-limit issues on cloud) ──
+    """Search papers using OpenAlex API (no rate limits, no API key needed)."""
     try:
-        ss_url = "https://api.semanticscholar.org/graph/v1/paper/search"
-        params = {
-            "query": query,
-            "limit": max_results,
-            "fields": "title,authors,year,abstract,externalIds,citationCount,openAccessPdf,fieldsOfStudy"
-        }
-        headers = {"User-Agent": "ScholarlyDiscoveryEngine/1.0 (MASC576 class project)"}
-        resp = requests.get(ss_url, params=params, headers=headers, timeout=15)
+        resp = requests.get(
+            f"{OPENALEX_BASE}/works",
+            params={
+                "search": query,
+                "per_page": max_results,
+                "select": "id,display_name,authorships,publication_year,abstract_inverted_index,"
+                          "cited_by_count,open_access,locations,topics",
+            },
+            headers=OA_HEADERS,
+            timeout=15,
+        )
         if resp.status_code == 200:
-            data = resp.json().get("data", [])
-            results = []
-            for p in data:
-                arxiv_id = (p.get("externalIds") or {}).get("ArXiv", "")
-                pdf_url = (p.get("openAccessPdf") or {}).get("url", "")
-                if not pdf_url and arxiv_id:
-                    pdf_url = f"https://arxiv.org/pdf/{arxiv_id}"
-                elif not pdf_url:
-                    pdf_url = "#"
-                fields = p.get("fieldsOfStudy") or []
-                primary_cat = fields[0].lower().replace(" ", "-") if fields else "other"
-                abstract = p.get("abstract") or "No abstract available."
-                results.append({
-                    "id": arxiv_id or p.get("paperId", "ss_" + str(random.randint(1000,9999))),
-                    "title": p.get("title", "Unknown Title"),
-                    "authors": [a["name"] for a in (p.get("authors") or [])[:3]],
-                    "abstract": (abstract[:400] + "...") if len(abstract) > 400 else abstract,
-                    "year": p.get("year") or 0,
-                    "url": pdf_url,
-                    "categories": [primary_cat],
-                    "primary_category": primary_cat,
-                    "citations": p.get("citationCount") or random.randint(5, 200),
-                })
-            if results:
-                return results
-    except Exception:
-        pass  # fall through to arXiv
-
-    # ── FALLBACK: arXiv XML API ──
-    NS = "http://www.w3.org/2005/Atom"
-    encoded_query = urllib.parse.quote(query)
-    url = (
-        f"https://export.arxiv.org/api/query"
-        f"?search_query=all:{encoded_query}"
-        f"&max_results={max_results}&sortBy=relevance&sortOrder=descending"
-    )
-    headers = {"User-Agent": "ScholarlyDiscoveryEngine/1.0 (MASC576 class project)"}
-    try:
-        time.sleep(1)
-        resp = requests.get(url, timeout=20, headers=headers)
-        if resp.status_code != 200:
-            st.error(f"Both search APIs failed (arXiv status {resp.status_code}). Please wait 30 seconds and try again.")
+            works = resp.json().get("results", [])
+            return [_oa_to_node(w, "seed") for w in works if w.get("display_name")]
+        else:
+            st.error(f"OpenAlex search failed (status {resp.status_code}). Please try again.")
             return []
     except Exception as e:
-        st.error(f"Search failed: {e}")
+        st.error(f"Search error: {e}")
         return []
 
-    root = ET.fromstring(resp.text)
-    results = []
-    for entry in root.findall(f"{{{NS}}}entry"):
-        title = entry.findtext(f"{{{NS}}}title", "").strip()
-        abstract = entry.findtext(f"{{{NS}}}summary", "").strip()
-        published = entry.findtext(f"{{{NS}}}published", "")
-        year = int(published[:4]) if published else 0
-        entry_id = entry.findtext(f"{{{NS}}}id", "").strip()
-        arxiv_id = entry_id.split("/abs/")[-1] if "/abs/" in entry_id else entry_id.split("/")[-1]
-        pdf_url = f"https://arxiv.org/pdf/{arxiv_id}"
-        authors = [a.findtext(f"{{{NS}}}name", "").strip() for a in entry.findall(f"{{{NS}}}author")]
-        cat_el = entry.find("{http://arxiv.org/schemas/atom}primary_category")
-        primary_cat = cat_el.get("term", "other") if cat_el is not None else "other"
-        results.append({
-            "id": arxiv_id,
-            "title": title,
-            "authors": authors[:3],
-            "abstract": (abstract[:400] + "...") if len(abstract) > 400 else abstract,
-            "year": year,
-            "url": pdf_url,
-            "categories": [primary_cat],
-            "primary_category": primary_cat,
-            "citations": random.randint(5, 500),
-        })
-    return results
-
-def fetch_semantic_scholar(arxiv_id: str):
-    """Get references and citing papers from Semantic Scholar."""
-    clean_id = arxiv_id.split("v")[0]
-    base = "https://api.semanticscholar.org/graph/v1/paper"
+def fetch_semantic_scholar(oa_id: str):
+    """Fetch references and citations for a paper using OpenAlex."""
+    # We store the full OpenAlex ID in the node; re-add prefix if needed
+    full_id = oa_id if oa_id.startswith("W") else oa_id
     try:
-        # Try to find the paper by arXiv ID
-        url = f"{base}/arXiv:{clean_id}?fields=title,year,authors,abstract,references,citations,externalIds,citationCount"
-        resp = requests.get(url, timeout=10)
+        resp = requests.get(
+            f"{OPENALEX_BASE}/works/{full_id}",
+            params={"select": "id,display_name,referenced_works,cited_by_api_url,"
+                              "cited_by_count,abstract_inverted_index,authorships,"
+                              "publication_year,topics,open_access,locations"},
+            headers=OA_HEADERS,
+            timeout=15,
+        )
         if resp.status_code == 200:
             return resp.json()
     except Exception:
@@ -264,64 +257,62 @@ def fetch_semantic_scholar(arxiv_id: str):
     return None
 
 def build_paper_node(paper: dict, node_type: str = "seed") -> dict:
-    """Build a standardized node dict."""
-    return {
-        "id": paper.get("id", paper.get("title", "unknown")[:30]),
-        "title": paper.get("title", "Unknown Title"),
-        "authors": paper.get("authors", []),
-        "abstract": paper.get("abstract", "No abstract available."),
-        "year": paper.get("year", 0),
-        "url": paper.get("url", "#"),
-        "primary_category": paper.get("primary_category", "other"),
-        "citations": paper.get("citations", 0),
-        "node_type": node_type,
-    }
+    """Build a standardized node dict (pass-through since _oa_to_node already does this)."""
+    node = dict(paper)
+    node["node_type"] = node_type
+    return node
 
-def snowball_from_semantic(ss_data: dict, depth: int = 1) -> tuple[list, list]:
-    """Extract references (backward) and citations (forward) from Semantic Scholar data."""
+def snowball_from_semantic(oa_data: dict, depth: int = 1) -> tuple[list, list]:
+    """Extract references (backward) and citations (forward) using OpenAlex data."""
     nodes = []
     edges = []
-    seed_id = ss_data.get("externalIds", {}).get("ArXiv", "seed")
+    seed_oa_id = oa_data.get("id", "").replace("https://openalex.org/", "")
 
-    # Backward snowballing — papers this paper cited
-    refs = ss_data.get("references", [])[:10]
-    for ref in refs:
-        if not ref.get("title"):
-            continue
-        ref_id = ref.get("externalIds", {}).get("ArXiv") or ref.get("paperId", "")[:10]
-        node = {
-            "id": ref_id or ref.get("title", "")[:20],
-            "title": ref.get("title", "Unknown"),
-            "authors": [a.get("name", "") for a in ref.get("authors", [])[:3]],
-            "abstract": "Reference paper (abstract not loaded).",
-            "year": ref.get("year") or 0,
-            "url": f"https://arxiv.org/abs/{ref_id}" if ref_id else "#",
-            "primary_category": "other",
-            "citations": ref.get("citationCount") or random.randint(10, 300),
-            "node_type": "backward",
-        }
-        nodes.append(node)
-        edges.append((seed_id, node["id"], "cites"))
+    # ── BACKWARD: papers this paper references ──
+    ref_ids = oa_data.get("referenced_works", [])[:10]
+    if ref_ids:
+        # Batch fetch up to 10 referenced works
+        ids_param = "|".join(r.replace("https://openalex.org/", "") for r in ref_ids)
+        try:
+            resp = requests.get(
+                f"{OPENALEX_BASE}/works",
+                params={
+                    "filter": f"openalex_id:{ids_param}",
+                    "per_page": 10,
+                    "select": "id,display_name,authorships,publication_year,cited_by_count,topics,open_access,locations",
+                },
+                headers=OA_HEADERS,
+                timeout=15,
+            )
+            if resp.status_code == 200:
+                for w in resp.json().get("results", []):
+                    n = _oa_to_node(w, "backward")
+                    nodes.append(n)
+                    edges.append((seed_oa_id, n["id"], "cites"))
+        except Exception:
+            pass
 
-    # Forward snowballing — papers that cite this paper
-    cites = ss_data.get("citations", [])[:10]
-    for cite in cites:
-        if not cite.get("title"):
-            continue
-        cite_id = cite.get("externalIds", {}).get("ArXiv") or cite.get("paperId", "")[:10]
-        node = {
-            "id": cite_id or cite.get("title", "")[:20],
-            "title": cite.get("title", "Unknown"),
-            "authors": [a.get("name", "") for a in cite.get("authors", [])[:3]],
-            "abstract": "Citing paper (abstract not loaded).",
-            "year": cite.get("year") or 0,
-            "url": f"https://arxiv.org/abs/{cite_id}" if cite_id else "#",
-            "primary_category": "other",
-            "citations": cite.get("citationCount") or random.randint(1, 100),
-            "node_type": "forward",
-        }
-        nodes.append(node)
-        edges.append((node["id"], seed_id, "cites"))
+    # ── FORWARD: papers that cite this paper ──
+    cited_by_url = oa_data.get("cited_by_api_url", "")
+    if cited_by_url:
+        try:
+            resp = requests.get(
+                cited_by_url,
+                params={
+                    "per_page": 10,
+                    "sort": "cited_by_count:desc",
+                    "select": "id,display_name,authorships,publication_year,cited_by_count,topics,open_access,locations",
+                },
+                headers=OA_HEADERS,
+                timeout=15,
+            )
+            if resp.status_code == 200:
+                for w in resp.json().get("results", []):
+                    n = _oa_to_node(w, "forward")
+                    nodes.append(n)
+                    edges.append((n["id"], seed_oa_id, "cites"))
+        except Exception:
+            pass
 
     return nodes, edges
 
@@ -529,7 +520,7 @@ if st.session_state.seed_paper:
         <h4 style="color:#ffd700">★ {seed['title']}</h4>
         <p>{", ".join(seed['authors'])}</p>
         <p style="margin-top:4px;color:#c9d1d9;font-size:12px">{seed['abstract'][:300]}...</p>
-        <div class="meta">arXiv:{seed['id']} · <a href="{seed['url']}" target="_blank" style="color:#58a6ff">Open PDF ↗</a></div>
+        <div class="meta">OpenAlex:{seed['id']} · <a href="{seed['url']}" target="_blank" style="color:#58a6ff">Open PDF ↗</a></div>
     </div>
     """, unsafe_allow_html=True)
 
@@ -544,20 +535,19 @@ if st.session_state.seed_paper:
             st.rerun()
 
     if expand_clicked:
-        with st.spinner("🕸️ Fetching references and citations from Semantic Scholar..."):
-            ss_data = fetch_semantic_scholar(seed["id"])
-            if ss_data:
-                nodes, edges = snowball_from_semantic(ss_data, depth=depth)
-                # Update seed citations from SS if available
-                seed["citations"] = ss_data.get("citationCount", seed["citations"])
+        with st.spinner("🕸️ Fetching references and citations from OpenAlex..."):
+            oa_data = fetch_semantic_scholar(seed["id"])
+            if oa_data:
+                nodes, edges = snowball_from_semantic(oa_data, depth=depth)
+                seed["citations"] = oa_data.get("cited_by_count", seed["citations"])
                 st.session_state.graph_nodes = nodes
                 st.session_state.graph_edges = edges
                 st.session_state.graph_built = True
-                st.success(f"✅ Found {len(nodes)} related papers via Semantic Scholar!")
+                st.success(f"✅ Found {len(nodes)} related papers via OpenAlex!")
             else:
-                # Fallback: arXiv-only snowball with related search
-                st.warning("⚠️ Semantic Scholar lookup failed — using arXiv-only fallback.")
-                related = search_arxiv(seed["title"][:50], max_results=10)
+                # Fallback: search for related papers by title
+                st.warning("⚠️ Could not fetch full paper data — using related search fallback.")
+                related = search_arxiv(seed["title"][:60], max_results=10)
                 nodes = [build_paper_node(p, "backward") for p in related if p["id"] != seed["id"]]
                 edges = [(seed["id"], n["id"], "related") for n in nodes]
                 st.session_state.graph_nodes = nodes
