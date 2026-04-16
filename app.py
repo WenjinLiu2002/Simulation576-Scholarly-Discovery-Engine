@@ -293,26 +293,26 @@ def snowball_from_semantic(oa_data: dict, depth: int = 1) -> tuple[list, list]:
             pass
 
     # ── FORWARD: papers that cite this paper ──
-    cited_by_url = oa_data.get("cited_by_api_url", "")
-    if cited_by_url:
-        try:
-            resp = requests.get(
-                cited_by_url,
-                params={
-                    "per_page": 10,
-                    "sort": "cited_by_count:desc",
-                    "select": "id,display_name,authorships,publication_year,cited_by_count,topics,open_access,locations",
-                },
-                headers=OA_HEADERS,
-                timeout=15,
-            )
-            if resp.status_code == 200:
-                for w in resp.json().get("results", []):
-                    n = _oa_to_node(w, "forward")
-                    nodes.append(n)
-                    edges.append((n["id"], seed_oa_id, "cites"))
-        except Exception:
-            pass
+    # Build the cited_by URL from the OpenAlex ID directly (more reliable)
+    cited_by_url = oa_data.get("cited_by_api_url") or f"{OPENALEX_BASE}/works?filter=cites:{seed_oa_id}"
+    try:
+        resp = requests.get(
+            cited_by_url,
+            params={
+                "per_page": 10,
+                "sort": "cited_by_count:desc",
+                "select": "id,display_name,authorships,publication_year,cited_by_count,topics,open_access,locations",
+            },
+            headers=OA_HEADERS,
+            timeout=15,
+        )
+        if resp.status_code == 200:
+            for w in resp.json().get("results", []):
+                n = _oa_to_node(w, "forward")
+                nodes.append(n)
+                edges.append((n["id"], seed_oa_id, "cites"))
+    except Exception:
+        pass
 
     return nodes, edges
 
@@ -391,7 +391,7 @@ def build_pyvis_graph(seed_node: dict, neighbor_nodes: list, edges: list,
 
     # Add neighbor nodes
     for n in neighbor_nodes:
-        if n["year"] and (n["year"] < min_year or n["year"] > max_year):
+        if n["year"] and n["year"] > 0 and (n["year"] < min_year or n["year"] > max_year):
             continue
         if filter_same_author:
             paper_authors = set(n.get("authors", []))
@@ -452,7 +452,7 @@ with st.sidebar:
 
     st.markdown("### 🗓️ Year Filter")
     year_range = st.slider("Publication year range", 1990, datetime.now().year,
-                           (2010, datetime.now().year))
+                           (1990, datetime.now().year))
 
     st.markdown("### 🔗 Connection Filters")
     filter_same_author = st.checkbox("Show only papers by same author(s)", value=False)
@@ -603,7 +603,7 @@ if st.session_state.seed_paper:
                 continue
             if type_filter == "Forward (citations)" and n.get("node_type") != "forward":
                 continue
-            if n["year"] and (n["year"] < year_range[0] or n["year"] > year_range[1]):
+            if n["year"] and n["year"] > 0 and (n["year"] < year_range[0] or n["year"] > year_range[1]):
                 continue
 
             badge_class = "badge-backward" if n.get("node_type") == "backward" else "badge-forward"
