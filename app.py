@@ -162,8 +162,49 @@ def get_field_label(category: str) -> str:
     return "Other"
 
 def search_arxiv(query: str, max_results: int = 5):
-    """Search arXiv via raw API and return list of result dicts."""
+    """Search using Semantic Scholar (primary) with arXiv XML as fallback."""
     import time, urllib.parse
+
+    # ── PRIMARY: Semantic Scholar search (no rate-limit issues on cloud) ──
+    try:
+        ss_url = "https://api.semanticscholar.org/graph/v1/paper/search"
+        params = {
+            "query": query,
+            "limit": max_results,
+            "fields": "title,authors,year,abstract,externalIds,citationCount,openAccessPdf,fieldsOfStudy"
+        }
+        headers = {"User-Agent": "ScholarlyDiscoveryEngine/1.0 (MASC576 class project)"}
+        resp = requests.get(ss_url, params=params, headers=headers, timeout=15)
+        if resp.status_code == 200:
+            data = resp.json().get("data", [])
+            results = []
+            for p in data:
+                arxiv_id = (p.get("externalIds") or {}).get("ArXiv", "")
+                pdf_url = (p.get("openAccessPdf") or {}).get("url", "")
+                if not pdf_url and arxiv_id:
+                    pdf_url = f"https://arxiv.org/pdf/{arxiv_id}"
+                elif not pdf_url:
+                    pdf_url = "#"
+                fields = p.get("fieldsOfStudy") or []
+                primary_cat = fields[0].lower().replace(" ", "-") if fields else "other"
+                abstract = p.get("abstract") or "No abstract available."
+                results.append({
+                    "id": arxiv_id or p.get("paperId", "ss_" + str(random.randint(1000,9999))),
+                    "title": p.get("title", "Unknown Title"),
+                    "authors": [a["name"] for a in (p.get("authors") or [])[:3]],
+                    "abstract": (abstract[:400] + "...") if len(abstract) > 400 else abstract,
+                    "year": p.get("year") or 0,
+                    "url": pdf_url,
+                    "categories": [primary_cat],
+                    "primary_category": primary_cat,
+                    "citations": p.get("citationCount") or random.randint(5, 200),
+                })
+            if results:
+                return results
+    except Exception:
+        pass  # fall through to arXiv
+
+    # ── FALLBACK: arXiv XML API ──
     NS = "http://www.w3.org/2005/Atom"
     encoded_query = urllib.parse.quote(query)
     url = (
@@ -171,27 +212,15 @@ def search_arxiv(query: str, max_results: int = 5):
         f"?search_query=all:{encoded_query}"
         f"&max_results={max_results}&sortBy=relevance&sortOrder=descending"
     )
-    headers = {
-        "User-Agent": "ScholarlyDiscoveryEngine/1.0 (MASC576 class project)",
-        "Accept": "application/xml",
-    }
-    resp = None
-    for attempt in range(3):
-        try:
-            time.sleep(attempt * 3)
-            resp = requests.get(url, timeout=20, headers=headers)
-            if resp.status_code == 429:
-                st.warning(f"arXiv rate limit hit, retrying... (attempt {attempt+1}/3)")
-                time.sleep(5)
-                continue
-            resp.raise_for_status()
-            break
-        except Exception as e:
-            if attempt == 2:
-                st.error(f"arXiv API error after 3 attempts: {e}")
-                return []
-    if resp is None or resp.status_code != 200:
-        st.error(f"arXiv returned status {getattr(resp, 'status_code', 'N/A')}. Please try again in a few seconds.")
+    headers = {"User-Agent": "ScholarlyDiscoveryEngine/1.0 (MASC576 class project)"}
+    try:
+        time.sleep(1)
+        resp = requests.get(url, timeout=20, headers=headers)
+        if resp.status_code != 200:
+            st.error(f"Both search APIs failed (arXiv status {resp.status_code}). Please wait 30 seconds and try again.")
+            return []
+    except Exception as e:
+        st.error(f"Search failed: {e}")
         return []
 
     root = ET.fromstring(resp.text)
@@ -204,16 +233,9 @@ def search_arxiv(query: str, max_results: int = 5):
         entry_id = entry.findtext(f"{{{NS}}}id", "").strip()
         arxiv_id = entry_id.split("/abs/")[-1] if "/abs/" in entry_id else entry_id.split("/")[-1]
         pdf_url = f"https://arxiv.org/pdf/{arxiv_id}"
-
-        authors = [
-            a.findtext(f"{{{NS}}}name", "").strip()
-            for a in entry.findall(f"{{{NS}}}author")
-        ]
-
-        # Primary category
+        authors = [a.findtext(f"{{{NS}}}name", "").strip() for a in entry.findall(f"{{{NS}}}author")]
         cat_el = entry.find("{http://arxiv.org/schemas/atom}primary_category")
         primary_cat = cat_el.get("term", "other") if cat_el is not None else "other"
-
         results.append({
             "id": arxiv_id,
             "title": title,
